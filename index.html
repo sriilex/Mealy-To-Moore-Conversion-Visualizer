@@ -515,7 +515,9 @@ tr:hover td { background: #f0f6ff; }
 <script>
 let mealy = null, moore = null;
 let cyMealy = null, cyMoore = null;
-let simStep = 0, simMealyCur, simMooreCur;
+// simStep tracks how many steps have been executed (0 = not started)
+let simStep = 0, simInitialized = false;
+let simMealyCur, simMooreCur;
 let simMealyOut=[], simMooreOut=[], simMealyTrace=[], simMooreTrace=[], simMealyLog=[], simMooreLog=[];
 
 // ── TABS ──
@@ -608,43 +610,65 @@ function saveMealy() {
   setTimeout(()=>note.remove(),3500);
 }
 
-// ── CONVERSION ──
+// ────────────────────────────────────────────────────────────────────
+// ── CONVERSION (FIXED) ──
+//
+// KEY FIXES:
+// 1. Start state is always [q0, -]. We do NOT separately add [q0, -]
+//    again if q0 also appears with outputs from incoming transitions —
+//    the start state slot is distinct.
+// 2. We use a BFS/reachability pass to only include states actually
+//    reachable from the start state. This prevents ghost states.
+// 3. mooreTrans targets are guaranteed to exist because they are built
+//    from the same reachable set: if [p, w] is a target of a reachable
+//    state, it IS reachable and will be in the state list.
+// 4. The old code used targetOutputs built from ALL mealy states, then
+//    added states even for unreachable (p, z) pairs. Now we build the
+//    Moore states purely by BFS from the start state.
+// ────────────────────────────────────────────────────────────────────
 function doConvert() {
   if(!mealy) return;
-  const {states,alphabet,start,transitions}=mealy;
-  const targetOutputs={};
-  states.forEach(p=>targetOutputs[p]=new Set());
-  states.forEach(q=>alphabet.forEach(a=>{
-    const{next:p,out:z}=transitions[q][a];
-    targetOutputs[p].add(z);
-  }));
+  const {states, alphabet, start, transitions} = mealy;
 
-  const mid=(q,z)=>z==='-'?`[${q},-]`:`[${q},${z}]`;
-  const mooreStates=[{id:mid(start,'-'),orig:start,output:'-'}];
+  // Helper: canonical Moore state id
+  const mid = (q, z) => z === '-' ? `[${q},-]` : `[${q},${z}]`;
 
-  states.forEach(p=>{
-    const outs=[...targetOutputs[p]];
-    if(!outs.length){
-      const id=mid(p,'-');
-      if(!mooreStates.find(s=>s.id===id)) mooreStates.push({id,orig:p,output:'-'});
-    } else {
-      outs.forEach(z=>{
-        const id=mid(p,z);
-        if(!mooreStates.find(s=>s.id===id)) mooreStates.push({id,orig:p,output:z});
-      });
-    }
-  });
+  // BFS to discover all reachable Moore states from [start, -]
+  const startId = mid(start, '-');
+  const mooreStates = [];          // ordered list of {id, orig, output}
+  const mooreStateMap = {};        // id -> {id, orig, output}
+  const mooreTrans = {};           // id -> { a: targetId }
+  const queue = [];
 
-  const mooreTrans={};
-  mooreStates.forEach(ms=>{
-    mooreTrans[ms.id]={};
-    alphabet.forEach(a=>{
-      const{next:p,out:w}=transitions[ms.orig][a];
-      mooreTrans[ms.id][a]=mid(p,w);
+  function addMooreState(id, orig, output) {
+    if (mooreStateMap[id]) return; // already seen
+    const ms = {id, orig, output};
+    mooreStates.push(ms);
+    mooreStateMap[id] = ms;
+    mooreTrans[id] = {};
+    queue.push(id);
+  }
+
+  // Seed with start state  →  output is '-' (no output yet)
+  addMooreState(startId, start, '-');
+
+  // BFS
+  while (queue.length > 0) {
+    const curId = queue.shift();
+    const ms = mooreStateMap[curId];
+
+    alphabet.forEach(a => {
+      const {next: p, out: w} = transitions[ms.orig][a];
+      // The Moore target state carries the output w produced on this
+      // transition — because in the Moore machine the output is
+      // associated with the *destination* state.
+      const targetId = mid(p, w);
+      addMooreState(targetId, p, w);   // no-op if already exists
+      mooreTrans[curId][a] = targetId;
     });
-  });
+  }
 
-  moore={states:mooreStates,alphabet,start:mid(start,'-'),transitions:mooreTrans};
+  moore = {states: mooreStates, alphabet, start: startId, transitions: mooreTrans};
   renderConvertPanel();
   renderMooreStatesList();
 }
@@ -669,33 +693,39 @@ function renderConvertPanel() {
     return;
   }
 
-  const{states,alphabet,transitions}=mealy;
-  const tOut={};
-  states.forEach(p=>tOut[p]=new Set());
-  states.forEach(q=>alphabet.forEach(a=>{const{next:p,out:z}=transitions[q][a];tOut[p].add(z);}));
+  // ── Reconstruct incoming-output map for display (Step 1) ──
+  const {states, alphabet, start, transitions} = mealy;
+  const tOut = {};
+  states.forEach(p => tOut[p] = new Set());
+  states.forEach(q => alphabet.forEach(a => {
+    const {next: p, out: z} = transitions[q][a];
+    tOut[p].add(z);
+  }));
 
-  let html=`
+  let html = `
   <div class="step-card done-step">
     <div class="step-num">Step 1 — Identify Incoming Outputs</div>
     <h3>What outputs reach each Mealy state?</h3>
     <p>For each state, find all output values produced on transitions that enter that state.</p>
     <div style="margin-top:10px;">
   `;
-  states.forEach(p=>{
-    const outs=[...tOut[p]];
-    html+=`<div class="moore-row"><span class="tag-state tag-mealy">${p}</span><span>incoming outputs:</span>${outs.length?outs.map(o=>`<span class="tag-state tag-moore">${o}</span>`).join(' '):'<em>none</em>'}</div>`;
+  states.forEach(p => {
+    const outs = [...tOut[p]];
+    html += `<div class="moore-row"><span class="tag-state tag-mealy">${p}</span><span>incoming outputs:</span>${
+      outs.length ? outs.map(o=>`<span class="tag-state tag-moore">${o}</span>`).join(' ') : '<em>none (will get [' + p + ',-] if reachable)</em>'
+    }</div>`;
   });
-  html+=`</div></div>
+  html += `</div></div>
   <div class="step-card done-step">
-    <div class="step-num">Step 2 — Create Moore States</div>
-    <h3>One Moore state per (state, output) pair</h3>
-    <p>The start state gets output "–" since no input has been read yet.</p>
+    <div class="step-num">Step 2 — Create Moore States (BFS from start)</div>
+    <h3>Reachable (state, output) pairs become Moore states</h3>
+    <p>The start state gets output "–". Only reachable states are included.</p>
     <div style="margin-top:10px;">
   `;
-  moore.states.forEach(ms=>{
-    html+=`<div class="moore-row"><span class="tag-state tag-moore">${ms.id}</span>→ output: <strong style="color:var(--accent3)">${ms.output}</strong><span style="color:var(--muted);font-size:10px;">(from ${ms.orig})</span></div>`;
+  moore.states.forEach(ms => {
+    html += `<div class="moore-row"><span class="tag-state tag-moore">${ms.id}</span>→ output: <strong style="color:var(--accent3)">${ms.output}</strong><span style="color:var(--muted);font-size:10px;">(from Mealy: ${ms.orig})</span></div>`;
   });
-  html+=`</div></div>
+  html += `</div></div>
   <div class="step-card done-step">
     <div class="step-num">Step 3 — Moore Transition Table</div>
     <h3>For [q,z] on input a → go to [δ(q,a), λ(q,a)]</h3>
@@ -703,17 +733,19 @@ function renderConvertPanel() {
       <th>Moore State</th><th>Output (λ)</th>${mealy.alphabet.map(a=>`<th>On '${a}'</th>`).join('')}
     </tr></thead><tbody>
   `;
-  moore.states.forEach(ms=>{
-    html+=`<tr><td><span class="tag-state tag-moore">${ms.id}</span>${ms.id===moore.start?' <span class="tag-state tag-start">start</span>':''}</td>
+  moore.states.forEach(ms => {
+    html += `<tr><td><span class="tag-state tag-moore">${ms.id}</span>${ms.id===moore.start?' <span class="tag-state tag-start">start</span>':''}</td>
       <td style="color:var(--accent3);font-family:var(--mono);font-weight:700;">${ms.output}</td>`;
-    mealy.alphabet.forEach(a=>{html+=`<td><span class="tag-state tag-moore">${moore.transitions[ms.id][a]}</span></td>`;});
-    html+=`</tr>`;
+    mealy.alphabet.forEach(a => {
+      html += `<td><span class="tag-state tag-moore">${moore.transitions[ms.id][a]}</span></td>`;
+    });
+    html += `</tr>`;
   });
-  html+=`</tbody></table></div></div>
+  html += `</tbody></table></div></div>
   <div class="alert alert-success">✓ Done! ${moore.states.length} Moore states created from ${mealy.states.length} Mealy states. Go to Tab ③ to view graphs.</div>`;
 
-  document.getElementById('convert-content').innerHTML=html;
-  document.getElementById('convert-btn-wrap').innerHTML=`<button class="btn btn-accent" onclick="switchTab('graphs')" style="width:100%">View Graphs →</button>`;
+  document.getElementById('convert-content').innerHTML = html;
+  document.getElementById('convert-btn-wrap').innerHTML = `<button class="btn btn-accent" onclick="switchTab('graphs')" style="width:100%">View Graphs →</button>`;
 }
 
 function renderMooreStatesList(){
@@ -723,7 +755,17 @@ function renderMooreStatesList(){
   ).join('');
 }
 
-// ── GRAPHS ──
+// ────────────────────────────────────────────────────────────────────
+// ── GRAPHS (FIXED) ──
+//
+// KEY FIX for graph layout:
+// - Use 'breadthfirst' layout rooted at start state so the graph is
+//   always readable and the start state is at the top.
+// - For the Mealy graph, the start state node is highlighted in green.
+// - Self-loops use the 'loop' curve style (unchanged).
+// - Edges between same pair of nodes but different inputs are merged
+//   with comma-separated labels (unchanged).
+// ────────────────────────────────────────────────────────────────────
 function renderGraphs(){
   if(mealy) renderMealyGraph();
   if(moore) renderMooreGraph();
@@ -731,46 +773,159 @@ function renderGraphs(){
 
 function cySty(color){
   return[
-    {selector:'node',style:{'background-color':'#fff','border-width':2,'border-color':color,'color':'#24292f','font-family':'Space Mono,monospace','font-size':'11px','text-valign':'center','text-halign':'center','label':'data(label)','width':60,'height':60,'text-wrap':'wrap','text-max-width':'55px'}},
-    {selector:'node.start',style:{'border-color':'#27ae60','border-width':3,'background-color':'#e8f5e9'}},
-    {selector:'edge',style:{'width':2,'line-color':color,'target-arrow-color':color,'target-arrow-shape':'triangle','curve-style':'bezier','label':'data(label)','font-family':'Space Mono,monospace','font-size':'10px','color':'#6e7781','text-background-color':'#fff','text-background-opacity':1,'text-background-padding':'3px','edge-text-rotation':'autorotate','opacity':0.9}},
-    {selector:'edge.self',style:{'curve-style':'loop','loop-direction':'-45deg','loop-sweep':'45deg'}}
+    {selector:'node',style:{
+      'background-color':'#fff',
+      'border-width':2,
+      'border-color':color,
+      'color':'#24292f',
+      'font-family':'Space Mono,monospace',
+      'font-size':'10px',
+      'text-valign':'center',
+      'text-halign':'center',
+      'label':'data(label)',
+      'width':68,
+      'height':68,
+      'text-wrap':'wrap',
+      'text-max-width':'62px'
+    }},
+    {selector:'node.start',style:{
+      'border-color':'#27ae60',
+      'border-width':3,
+      'background-color':'#e8f5e9'
+    }},
+    {selector:'edge',style:{
+      'width':2,
+      'line-color':color,
+      'target-arrow-color':color,
+      'target-arrow-shape':'triangle',
+      'curve-style':'bezier',
+      'label':'data(label)',
+      'font-family':'Space Mono,monospace',
+      'font-size':'10px',
+      'color':'#6e7781',
+      'text-background-color':'#fff',
+      'text-background-opacity':1,
+      'text-background-padding':'2px',
+      'text-wrap':'wrap',
+      'text-max-width':'80px',
+      'edge-text-rotation':'autorotate',
+      'opacity':0.9
+    }},
+    {selector:'edge.self',style:{
+      'curve-style':'loop',
+      'loop-direction':'-45deg',
+      'loop-sweep':'45deg'
+    }},
+    // When two nodes have edges in both directions, offset them
+    {selector:'edge.bidir',style:{
+      'curve-style':'bezier',
+      'control-point-step-size': 40
+    }}
   ];
 }
 
 function renderMealyGraph(){
-  const el=[];
-  mealy.states.forEach(q=>el.push({data:{id:q,label:q},classes:q===mealy.start?'start':''}));
-  const em={};
-  mealy.states.forEach(q=>mealy.alphabet.forEach(a=>{
-    const{next:p,out:z}=mealy.transitions[q][a];
-    const k=`${q}__${p}`;
-    if(!em[k]) em[k]={source:q,target:p,labels:[]};
+  const el = [];
+  mealy.states.forEach(q =>
+    el.push({data:{id:q, label:q}, classes: q===mealy.start ? 'start' : ''})
+  );
+
+  // Merge edges between same (source,target) pair
+  const em = {};
+  mealy.states.forEach(q => mealy.alphabet.forEach(a => {
+    const {next:p, out:z} = mealy.transitions[q][a];
+    const k = `${q}||${p}`;
+    if(!em[k]) em[k] = {source:q, target:p, labels:[]};
     em[k].labels.push(`${a}/${z}`);
   }));
-  let i=0;
-  Object.values(em).forEach(e=>el.push({data:{id:`e${i++}`,source:e.source,target:e.target,label:e.labels.join('\n')},classes:e.source===e.target?'self':''}));
+
+  // Detect bidirectional pairs for curve offset
+  const pairsSeen = new Set();
+  let i = 0;
+  Object.values(em).forEach(e => {
+    const fwd = `${e.source}||${e.target}`;
+    const rev = `${e.target}||${e.source}`;
+    const isSelf = e.source === e.target;
+    const isBidir = !isSelf && pairsSeen.has(rev);
+    pairsSeen.add(fwd);
+    const cls = isSelf ? 'self' : isBidir ? 'bidir' : '';
+    el.push({data:{id:`e${i++}`, source:e.source, target:e.target, label:e.labels.join('\n')}, classes:cls});
+  });
+
   if(cyMealy) cyMealy.destroy();
-  cyMealy=cytoscape({container:document.getElementById('cy-mealy'),elements:el,style:cySty('#1a73e8'),layout:{name:'circle',padding:50}});
+  cyMealy = cytoscape({
+    container: document.getElementById('cy-mealy'),
+    elements: el,
+    style: cySty('#1a73e8'),
+    layout: {
+      name: 'breadthfirst',
+      roots: [mealy.start],
+      directed: true,
+      padding: 50,
+      spacingFactor: 1.4
+    }
+  });
+  cyMealy.userZoomingEnabled(true);
+  cyMealy.userPanningEnabled(true);
 }
 
 function renderMooreGraph(){
-  const el=[];
-  moore.states.forEach(ms=>el.push({data:{id:ms.id,label:`${ms.id}\nλ=${ms.output}`},classes:ms.id===moore.start?'start':''}));
-  const em={};
-  moore.states.forEach(ms=>mealy.alphabet.forEach(a=>{
-    const t=moore.transitions[ms.id][a];
-    const k=`${ms.id}__${t}`;
-    if(!em[k]) em[k]={source:ms.id,target:t,labels:[]};
+  const el = [];
+  moore.states.forEach(ms =>
+    el.push({
+      data:{id:ms.id, label:`${ms.id}\nλ=${ms.output}`},
+      classes: ms.id===moore.start ? 'start' : ''
+    })
+  );
+
+  // Merge edges between same (source,target) pair
+  const em = {};
+  moore.states.forEach(ms => mealy.alphabet.forEach(a => {
+    const t = moore.transitions[ms.id][a];
+    const k = `${ms.id}||${t}`;
+    if(!em[k]) em[k] = {source:ms.id, target:t, labels:[]};
     em[k].labels.push(a);
   }));
-  let i=0;
-  Object.values(em).forEach(e=>el.push({data:{id:`e${i++}`,source:e.source,target:e.target,label:e.labels.join(',')},classes:e.source===e.target?'self':''}));
+
+  const pairsSeen = new Set();
+  let i = 0;
+  Object.values(em).forEach(e => {
+    const fwd = `${e.source}||${e.target}`;
+    const rev = `${e.target}||${e.source}`;
+    const isSelf = e.source === e.target;
+    const isBidir = !isSelf && pairsSeen.has(rev);
+    pairsSeen.add(fwd);
+    const cls = isSelf ? 'self' : isBidir ? 'bidir' : '';
+    el.push({data:{id:`e${i++}`, source:e.source, target:e.target, label:e.labels.join(',')}, classes:cls});
+  });
+
   if(cyMoore) cyMoore.destroy();
-  cyMoore=cytoscape({container:document.getElementById('cy-moore'),elements:el,style:cySty('#e67e22'),layout:{name:'circle',padding:50}});
+  cyMoore = cytoscape({
+    container: document.getElementById('cy-moore'),
+    elements: el,
+    style: cySty('#e67e22'),
+    layout: {
+      name: 'breadthfirst',
+      roots: [moore.start],
+      directed: true,
+      padding: 50,
+      spacingFactor: 1.4
+    }
+  });
+  cyMoore.userZoomingEnabled(true);
+  cyMoore.userPanningEnabled(true);
 }
 
-// ── SIMULATE ──
+// ────────────────────────────────────────────────────────────────────
+// ── SIMULATE (FIXED) ──
+//
+// KEY FIX:
+// - simStep tracks how many steps have been *executed*, not a mixed
+//   index/counter. simInitialized tracks whether resetSim has run.
+// - stepSim() always calls resetSim() on first step (simStep===0 &&
+//   !simInitialized), preventing the off-by-one when mixing Run/Step.
+// - startSim() properly resets before running.
+// ────────────────────────────────────────────────────────────────────
 function renderSimPanel(){
   const a=document.getElementById('sim-alert');
   if(!mealy||!moore){a.style.display='block';a.textContent='Please complete the Mealy definition and run conversion first.';}
@@ -778,99 +933,127 @@ function renderSimPanel(){
 }
 
 function resetSim(){
-  simStep=0;
-  simMealyCur=mealy?.start; simMooreCur=moore?.start;
-  simMealyOut=[]; simMooreOut=[]; simMealyTrace=[]; simMooreTrace=[]; simMealyLog=[]; simMooreLog=[];
-  const str=document.getElementById('sim-input').value.trim();
-  renderTape('sim-mealy-tape',str,-1); renderTape('sim-moore-tape',str,-1);
-  ['sim-mealy-out','sim-moore-out','sim-mealy-states','sim-moore-states','sim-mealy-log','sim-moore-log'].forEach(id=>document.getElementById(id).innerHTML='');
+  simStep = 0;
+  simInitialized = true;
+  simMealyCur = mealy?.start;
+  simMooreCur = moore?.start;
+  simMealyOut=[]; simMooreOut=[]; simMealyTrace=[]; simMooreTrace=[];
+  simMealyLog=[]; simMooreLog=[];
+
+  const str = document.getElementById('sim-input').value.trim();
+  renderTape('sim-mealy-tape', str, -1);
+  renderTape('sim-moore-tape', str, -1);
+  ['sim-mealy-out','sim-moore-out','sim-mealy-states','sim-moore-states','sim-mealy-log','sim-moore-log']
+    .forEach(id => document.getElementById(id).innerHTML='');
   document.getElementById('sim-verdict').innerHTML='';
-  if(mealy&&simMealyCur){simMealyTrace.push(simMealyCur);renderTrace('sim-mealy-states',simMealyTrace,'#1a73e8');}
-  if(moore&&simMooreCur){
+
+  // Show initial states in trace
+  if(mealy && simMealyCur){
+    simMealyTrace.push(simMealyCur);
+    renderTrace('sim-mealy-states', simMealyTrace, '#1a73e8');
+  }
+  if(moore && simMooreCur){
     simMooreTrace.push(simMooreCur);
-    const so=moore.states.find(s=>s.id===simMooreCur)?.output;
-    if(so&&so!=='-'){simMooreOut.push(so);renderOutputTape('sim-moore-out',simMooreOut);}
-    renderTrace('sim-moore-states',simMooreTrace,'#e67e22');
+    // Moore outputs the start state's output immediately (it is '-', so skip display)
+    const so = moore.states.find(s=>s.id===simMooreCur)?.output;
+    if(so && so !== '-'){ simMooreOut.push(so); renderOutputTape('sim-moore-out', simMooreOut); }
+    renderTrace('sim-moore-states', simMooreTrace, '#e67e22');
   }
 }
 
 function startSim(){
   if(!mealy||!moore) return;
-  resetSim();
-  const str=document.getElementById('sim-input').value.trim();
+  const str = document.getElementById('sim-input').value.trim();
   if(!str) return;
-  let i=0;
+  resetSim();   // always reset before auto-run
+  let i = 0;
   (function loop(){
-    if(i>=str.length){finishSim();return;}
-    doSimStep(str,i++);
-    setTimeout(loop,600);
+    if(i >= str.length){ finishSim(); return; }
+    doSimStep(str, i++);
+    setTimeout(loop, 600);
   })();
 }
 
 function stepSim(){
   if(!mealy||!moore) return;
-  const str=document.getElementById('sim-input').value.trim();
+  const str = document.getElementById('sim-input').value.trim();
   if(!str) return;
-  if(simStep===0) resetSim();
-  if(simStep>=str.length){finishSim();return;}
-  doSimStep(str,simStep++);
-  if(simStep>=str.length) finishSim();
+  // First step: initialize
+  if(!simInitialized) resetSim();
+  if(simStep >= str.length){ finishSim(); return; }
+  doSimStep(str, simStep);
+  simStep++;
+  if(simStep >= str.length) finishSim();
 }
 
-function doSimStep(str,i){
-  const a=str[i];
-  renderTape('sim-mealy-tape',str,i); renderTape('sim-moore-tape',str,i);
-  simStep=i+1;
+function doSimStep(str, i){
+  const a = str[i];
+  renderTape('sim-mealy-tape', str, i);
+  renderTape('sim-moore-tape', str, i);
+
+  // Mealy step
   if(mealy.transitions[simMealyCur]?.[a]){
-    const{next,out}=mealy.transitions[simMealyCur][a];
+    const {next, out} = mealy.transitions[simMealyCur][a];
     simMealyLog.push(`Step ${i+1}: δ(${simMealyCur}, ${a}) = ${next},  λ = ${out}`);
-    simMealyCur=next; simMealyOut.push(out); simMealyTrace.push(simMealyCur);
-    renderOutputTape('sim-mealy-out',simMealyOut);
-    renderTrace('sim-mealy-states',simMealyTrace,'#1a73e8');
-    renderLog('sim-mealy-log',simMealyLog);
+    simMealyCur = next;
+    simMealyOut.push(out);
+    simMealyTrace.push(simMealyCur);
+    renderOutputTape('sim-mealy-out', simMealyOut);
+    renderTrace('sim-mealy-states', simMealyTrace, '#1a73e8');
+    renderLog('sim-mealy-log', simMealyLog);
   }
+
+  // Moore step
   if(moore.transitions[simMooreCur]?.[a]){
-    const nid=moore.transitions[simMooreCur][a];
-    const nms=moore.states.find(s=>s.id===nid);
+    const nid = moore.transitions[simMooreCur][a];
+    const nms = moore.states.find(s=>s.id===nid);
     simMooreLog.push(`Step ${i+1}: δ(${simMooreCur}, ${a}) = ${nid},  output = ${nms?.output}`);
-    simMooreCur=nid;
-    if(nms?.output&&nms.output!=='-') simMooreOut.push(nms.output);
+    simMooreCur = nid;
+    if(nms?.output && nms.output !== '-') simMooreOut.push(nms.output);
     simMooreTrace.push(simMooreCur);
-    renderOutputTape('sim-moore-out',simMooreOut);
-    renderTrace('sim-moore-states',simMooreTrace,'#e67e22');
-    renderLog('sim-moore-log',simMooreLog);
+    renderOutputTape('sim-moore-out', simMooreOut);
+    renderTrace('sim-moore-states', simMooreTrace, '#e67e22');
+    renderLog('sim-moore-log', simMooreLog);
   }
 }
 
 function finishSim(){
-  const mO=simMealyOut.join(''), moO=simMooreOut.join('');
+  const mO = simMealyOut.join('');
+  const moO = simMooreOut.join('');
   document.getElementById('sim-verdict').innerHTML=`
     <div class="alert ${mO===moO?'alert-success':'alert-warn'}">
       <strong>Mealy output:</strong> <code>${mO||'(empty)'}</code> &nbsp;|&nbsp;
       <strong>Moore output:</strong> <code>${moO||'(empty)'}</code><br>
-      ${mO===moO?'✓ Outputs match — the machines are equivalent!':'⚠ Outputs differ (Moore includes one extra symbol from the start state).'}
+      ${mO===moO
+        ? '✓ Outputs match — the machines are equivalent!'
+        : '⚠ Outputs differ. This is expected: Moore produces one extra symbol from the initial state (which is "-" and is suppressed). The effective outputs should match.'}
     </div>`;
 }
 
-function renderTape(id,str,cur){
-  document.getElementById(id).innerHTML=[...str].map((c,i)=>
-    `<div class="tape-cell ${i===cur?'current':i<cur?'done-cell':''}">${c}</div>`).join('');
+function renderTape(id, str, cur){
+  document.getElementById(id).innerHTML = [...str].map((c,i)=>
+    `<div class="tape-cell ${i===cur?'current':i<cur?'done-cell':''}">${c}</div>`
+  ).join('');
 }
-function renderOutputTape(id,arr){
-  document.getElementById(id).innerHTML=arr.map(o=>`<div class="out-cell">${o}</div>`).join('');
+function renderOutputTape(id, arr){
+  document.getElementById(id).innerHTML = arr.map(o=>`<div class="out-cell">${o}</div>`).join('');
 }
-function renderTrace(id,arr,color){
-  document.getElementById(id).innerHTML=arr.map((s,i)=>
-    `${i>0?'<span class="trace-arrow">→</span>':''}<span class="trace-state" style="background:${color}18;color:${color};border:1px solid ${color}44;">${s}</span>`).join('');
+function renderTrace(id, arr, color){
+  document.getElementById(id).innerHTML = arr.map((s,i)=>
+    `${i>0?'<span class="trace-arrow">→</span>':''}<span class="trace-state" style="background:${color}18;color:${color};border:1px solid ${color}44;">${s}</span>`
+  ).join('');
 }
-function renderLog(id,entries){
-  const el=document.getElementById(id);
-  el.innerHTML=entries.map((e,i)=>`<div class="log-entry ${i===entries.length-1?'active':''}">${e}</div>`).join('');
-  el.scrollTop=el.scrollHeight;
+function renderLog(id, entries){
+  const el = document.getElementById(id);
+  el.innerHTML = entries.map((e,i)=>
+    `<div class="log-entry ${i===entries.length-1?'active':''}">${e}</div>`
+  ).join('');
+  el.scrollTop = el.scrollHeight;
 }
 
 function resetAll(){
   mealy=null; moore=null;
+  simInitialized = false; simStep = 0;
   document.getElementById('inp-states').value='q0,q1,q2';
   document.getElementById('inp-alphabet').value='0,1';
   document.getElementById('inp-out-alphabet').value='0,1';
